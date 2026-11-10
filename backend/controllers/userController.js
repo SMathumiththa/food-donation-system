@@ -1,8 +1,13 @@
+const BASE_URL = process.env.API_PUBLIC_URL || process.env.BACKEND_URL || 'http://localhost:5000';
 const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
-const { sendPasswordResetEmail, sendTwoFactorCodeEmail } = require("../services/emailService");
+const {
+  sendPasswordResetEmail,
+  sendTwoFactorCodeEmail,
+  sendVerificationEmail,
+} = require("../services/emailService");
 
 const pendingLoginAttempts = new Map();
 
@@ -90,7 +95,7 @@ exports.registerUser = async (req, res) => {
       });
     }
 
-    const allowedRoles = ["donor", "ngo"];
+    const allowedRoles = ["donor", "ngo", "volunteer"];
     if (role && !allowedRoles.includes(role)) {
       return res.status(400).json({ success: false, message: "Invalid role" });
     }
@@ -127,8 +132,13 @@ exports.registerUser = async (req, res) => {
       emailVerificationExpires: codeExpires,
     });
 
-    // Send verification email
-    await require("../services/emailService").sendVerificationEmail(user.email, user.name, verificationCode);
+    const emailResult = await sendVerificationEmail(user.email, user.name, verificationCode);
+    if (!emailResult.success) {
+      return res.status(503).json({
+        success: false,
+        message: "Your account was created, but the verification email could not be sent. Please use resend verification after email service is available.",
+      });
+    }
 
     const token = user.status === "active" ? generateToken(user._id, user.role) : null;
     res.status(201).json({
@@ -193,6 +203,62 @@ exports.verifyEmail = async (req, res) => {
   }
 };
 
+// ✅ RESEND VERIFICATION CODE
+exports.resendVerificationCode = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required" });
+    }
+
+    const trimmedEmail = email.trim().toLowerCase();
+    const user = await User.findOne({ email: trimmedEmail });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "No account found with this email" });
+    }
+
+    if (user.isEmailVerified) {
+      return res.status(400).json({ success: false, message: "Email is already verified. You can proceed to login." });
+    }
+
+    // Cooldown check: max 1 request every 45 seconds
+    if (user.emailVerificationExpires) {
+      const msRemaining = user.emailVerificationExpires.getTime() - Date.now();
+      const msElapsed = (20 * 60 * 1000) - msRemaining;
+      if (msElapsed < 45 * 1000 && msElapsed > 0) {
+        const waitSec = Math.ceil((45 * 1000 - msElapsed) / 1000);
+        return res.status(429).json({
+          success: false,
+          message: `Please wait ${waitSec}s before requesting a new code.`
+        });
+      }
+    }
+
+    const verificationCode = crypto.randomInt(100000, 1000000).toString();
+    const hashedCode = crypto.createHash("sha256").update(verificationCode).digest("hex");
+    const codeExpires = new Date(Date.now() + 20 * 60 * 1000); // 20 mins
+
+    user.emailVerificationCode = hashedCode;
+    user.emailVerificationExpires = codeExpires;
+    await user.save();
+
+    const emailResult = await sendVerificationEmail(user.email, user.name, verificationCode);
+    if (!emailResult.success) {
+      return res.status(503).json({
+        success: false,
+        message: "The verification email could not be sent. Please try again later.",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "A new verification code has been sent to your email!"
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // ✅ LOGIN USER
 exports.loginUser = async (req, res) => {
   try {
@@ -212,6 +278,15 @@ exports.loginUser = async (req, res) => {
       return res
         .status(400)
         .json({ success: false, message: "Invalid email or password" });
+    }
+
+    if (!user.isEmailVerified && user.status === "pending" && user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        isEmailUnverified: true,
+        email: user.email,
+        message: "Your email is not verified yet. Please verify your email with the code sent to your inbox.",
+      });
     }
 
     if (user.status !== "active") {
@@ -242,7 +317,14 @@ exports.loginUser = async (req, res) => {
           codeHash: hashOtp(otp),
           expiresAt: Date.now() + 5 * 60 * 1000,
         });
-        await sendTwoFactorCodeEmail(user.email, user.name, otp);
+        const emailResult = await sendTwoFactorCodeEmail(user.email, user.name, otp);
+        if (!emailResult.success) {
+          pendingLoginAttempts.delete(pendingKey);
+          return res.status(503).json({
+            success: false,
+            message: "The login verification email could not be sent. Please try again later.",
+          });
+        }
         return res.json({
           success: true,
           requires2FA: true,
@@ -314,9 +396,15 @@ exports.requestPasswordReset = async (req, res) => {
       user.passwordResetExpires = new Date(Date.now() + 20 * 60 * 1000); // 20 minutes
       await user.save();
 
-      const { previewUrl } = await sendPasswordResetEmail(user.email, user.name, resetCode);
-      if (previewUrl) {
-        console.log(`[DEV ONLY] Password reset preview URL: ${previewUrl}`);
+      const emailResult = await sendPasswordResetEmail(user.email, user.name, resetCode);
+      if (!emailResult.success) {
+        return res.status(503).json({
+          success: false,
+          message: "The password reset email could not be sent. Please try again later.",
+        });
+      }
+      if (emailResult.previewUrl) {
+        console.log(`[DEV ONLY] Password reset preview URL: ${emailResult.previewUrl}`);
       }
     }
 
@@ -423,7 +511,7 @@ exports.updateDonationSettings = async (req, res) => {
       const { isCloudinaryConfigured } = require("../config/cloudinary");
       user.donationSettings.qrCodeImage = isCloudinaryConfigured
         ? req.file.path
-        : `http://localhost:5000/uploads/${req.file.filename}`;
+        : `${BASE_URL}/uploads/${req.file.filename}`;
     }
 
     await user.save();
@@ -449,7 +537,7 @@ exports.updateProfile = async (req, res) => {
       if (isCloudinaryConfigured) {
         profileImage = req.file.path;
       } else {
-        profileImage = `http://localhost:5000/uploads/${req.file.filename}`;
+        profileImage = `${BASE_URL}/uploads/${req.file.filename}`;
       }
     }
 
@@ -551,12 +639,5 @@ exports.updatePassword = async (req, res) => {
   }
 };
 
-// GET Leaderboard (top donors by points)
+// GET leaderboard by points
 exports.getLeaderboard = async (req, res) => {
-  try {
-    const top = await User.find({ role: 'donor' }).select('name organization points badge profileImage totalDonations').sort({ points: -1 }).limit(10);
-    res.json({ success: true, data: top });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
